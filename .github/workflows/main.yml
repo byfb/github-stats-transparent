@@ -46,6 +46,9 @@ jobs:
         python3 -m pip install --upgrade pip setuptools wheel
         python3 -m pip install -r requirements.txt
 
+    - name: Test statistics collection
+      run: python3 -m unittest discover -s tests -v
+
     # Generate all statistics images
     - name: Generate images
       run: |

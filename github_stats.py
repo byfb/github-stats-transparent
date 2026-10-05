@@ -1,16 +1,24 @@
 #!/usr/bin/python3
 
 import asyncio
+import json
 import os
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
-import requests
 
 
 ###############################################################################
 # Main Classes
 ###############################################################################
+
+class GitHubAPIError(RuntimeError):
+    """An incomplete API response that must not be published as zero stats."""
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
 
 class Queries(object):
     """
@@ -37,20 +45,28 @@ class Queries(object):
         }
         try:
             async with self.semaphore:
-                r = await self.session.post("https://api.github.com/graphql",
-                                            headers=headers,
-                                            json={"query": generated_query})
-            return await r.json()
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r = requests.post("https://api.github.com/graphql",
-                                  headers=headers,
-                                  json={"query": generated_query})
-                return r.json()
+                async with self.session.post(
+                    "https://api.github.com/graphql", headers=headers,
+                    json={"query": generated_query},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status != 200:
+                        raise GitHubAPIError(
+                            f"GitHub GraphQL request failed (HTTP {r.status}).",
+                            r.status,
+                        )
+                    result = await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            # Do not expose API URLs or response bodies containing private repos.
+            raise GitHubAPIError("Could not read a GitHub GraphQL response.") from None
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+        if (not isinstance(result, dict) or result.get("errors")
+                or not isinstance(result.get("data"), dict)):
+            raise GitHubAPIError("GitHub returned incomplete GraphQL data.")
+        return result
+
+    async def query_rest(self, path: str, params: Optional[Dict] = None
+                         ) -> Optional[Union[Dict, List]]:
         """
         Make a request to the REST API
         :param path: API path to query
@@ -58,44 +74,29 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
+        headers = {"Authorization": f"token {self.access_token}"}
+        path = path.lstrip("/")
         for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
             try:
                 async with self.semaphore:
-                    r = await self.session.get(f"https://api.github.com/{path}",
-                                               headers=headers,
-                                               params=tuple(params.items()))
-                if r.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
-                    continue
+                    async with self.session.get(
+                        f"https://api.github.com/{path}", headers=headers,
+                        params=params or {}, timeout=aiohttp.ClientTimeout(total=30),
+                    ) as r:
+                        if r.status == 204:
+                            return None
+                        if r.status == 200:
+                            return await r.json()
+                        if r.status != 202:
+                            raise GitHubAPIError(
+                                f"GitHub REST request failed (HTTP {r.status}).",
+                                r.status,
+                            )
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                raise GitHubAPIError("Could not read a GitHub REST response.") from None
+            await asyncio.sleep(2)
 
-                result = await r.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r = requests.get(f"https://api.github.com/{path}",
-                                     headers=headers,
-                                     params=tuple(params.items()))
-                    if r.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r.status_code == 200:
-                        return r.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
-        return dict()
+        raise GitHubAPIError("GitHub statistics are still being computed.", 202)
 
     @staticmethod
     def repos_overview(contrib_cursor: Optional[str] = None,
@@ -105,6 +106,7 @@ class Queries(object):
         """
         return f"""{{
   viewer {{
+    id,
     login,
     name,
     repositories(
@@ -122,6 +124,7 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
+        isEmpty
         stargazers {{
           totalCount
         }}
@@ -158,6 +161,7 @@ class Queries(object):
       }}
       nodes {{
         nameWithOwner
+        isEmpty
         stargazers {{
           totalCount
         }}
@@ -176,6 +180,34 @@ class Queries(object):
   }}
 }}
 """
+
+    @staticmethod
+    def commit_history(repo: str, user_id: str,
+                       cursor: Optional[str] = None) -> str:
+        """Read authored commits using the account's stable GraphQL node ID."""
+        owner, name = repo.split("/", 1)
+        return f"""{{
+  repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{
+    defaultBranchRef {{
+      target {{
+        ... on Commit {{
+          history(first: 100, after: {json.dumps(cursor)},
+                  author: {{id: {json.dumps(user_id)}}}) {{
+            pageInfo {{
+              hasNextPage
+              endCursor
+            }}
+            nodes {{
+              additions
+              deletions
+              parents {{ totalCount }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"""
 
     @staticmethod
     def contrib_years() -> str:
@@ -241,11 +273,14 @@ class Stats(object):
         self.queries = Queries(username, access_token, session)
 
         self._name = None
+        self._user_id = None
         self._stargazers = None
         self._forks = None
         self._total_contributions = None
         self._languages = None
         self._repos = None
+        self._ignored_repos = None
+        self._empty_repos = set()
         self._lines_changed = None
         self._views = None        
 
@@ -279,6 +314,7 @@ Languages:
         self._languages = dict()
         self._repos = set()
         self._ignored_repos = set()
+        self._empty_repos = set()
         
         next_owned = None
         next_contrib = None
@@ -288,6 +324,16 @@ Languages:
                                        contrib_cursor=next_contrib)
             )
             raw_results = raw_results if raw_results is not None else {}
+
+            viewer = raw_results.get("data", {}).get("viewer")
+            if (not isinstance(viewer, dict)
+                    or not isinstance(viewer.get("id"), str) or not viewer["id"]
+                    or not viewer.get("login")):
+                raise GitHubAPIError("Could not identify the account being measured.")
+            # The token owner is also the subject of all other statistics.
+            # Account IDs survive renames; workflow actors and cached logins do not.
+            self._user_id = viewer["id"]
+            self.username = viewer["login"]
 
             self._name = (raw_results
                           .get("data", {})
@@ -307,6 +353,10 @@ Languages:
                            .get("data", {})
                            .get("viewer", {})
                            .get("repositories", {}))
+
+            for repo in owned_repos.get("nodes", []) + contrib_repos.get("nodes", []):
+                if repo.get("isEmpty"):
+                    self._empty_repos.add(repo["nameWithOwner"])
             
             repos = owned_repos.get("nodes", [])
             if self._consider_forked_repos:
@@ -466,25 +516,51 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
-        additions = 0
-        deletions = 0
-        for repo in await self.all_repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
-            for author_obj in r:
-                # Handle malformed response from the API by skipping this repo
-                if (not isinstance(author_obj, dict)
-                        or not isinstance(author_obj.get("author", {}), dict)):
-                    continue
-                author = author_obj.get("author", {}).get("login", "")
-                if author != self.username:
-                    continue
-
-                for week in author_obj.get("weeks", []):
-                    additions += week.get("a", 0)
-                    deletions += week.get("d", 0)
-
-        self._lines_changed = (additions, deletions)
+        repos = await self.all_repos
+        # The contributor-statistics endpoint can omit contributions even with
+        # HTTP 200. Sum actual commits instead, filtering by stable account ID.
+        totals = await asyncio.gather(*(
+            self._count_commit_lines(repo)
+            for repo in repos if repo not in self._empty_repos
+        ))
+        self._lines_changed = (
+            sum(added for added, _ in totals),
+            sum(deleted for _, deleted in totals),
+        )
         return self._lines_changed
+
+    async def _count_commit_lines(self, repo: str) -> Tuple[int, int]:
+        """Count authored, non-merge commits on a repository's default branch."""
+        additions = deletions = 0
+        cursor = None
+        while True:
+            result = await self.queries.query(
+                Queries.commit_history(repo, self._user_id, cursor))
+            repository = result.get("data", {}).get("repository") or {}
+            branch = repository.get("defaultBranchRef") or {}
+            history = (branch.get("target") or {}).get("history") or {}
+            commits = history.get("nodes")
+            page_info = history.get("pageInfo") or {}
+            if (not isinstance(commits, list)
+                    or not isinstance(page_info.get("hasNextPage"), bool)):
+                raise GitHubAPIError("GitHub returned incomplete commit history.")
+            for commit in commits:
+                if (not isinstance(commit, dict)
+                        or not isinstance(commit.get("additions"), int)
+                        or not isinstance(commit.get("deletions"), int)
+                        or not isinstance(commit.get("parents"), dict)
+                        or not isinstance(commit["parents"].get("totalCount"), int)):
+                    raise GitHubAPIError("GitHub returned incomplete commit line counts.")
+                if commit["parents"]["totalCount"] > 1:
+                    continue
+                additions += commit["additions"]
+                deletions += commit["deletions"]
+            if not page_info["hasNextPage"]:
+                return additions, deletions
+            next_cursor = page_info.get("endCursor")
+            if not next_cursor or next_cursor == cursor:
+                raise GitHubAPIError("GitHub returned incomplete commit pagination.")
+            cursor = next_cursor
 
     @property
     async def views(self) -> int:
@@ -497,7 +573,19 @@ Languages:
 
         total = 0
         for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
+            if repo in self._empty_repos:
+                continue
+            try:
+                r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
+            except GitHubAPIError as error:
+                # Traffic is only available with sufficient repository access.
+                if error.status in (403, 404):
+                    continue
+                raise
+            if r is None:
+                continue
+            if not isinstance(r, dict) or not isinstance(r.get("views"), list):
+                raise GitHubAPIError("GitHub returned incomplete traffic statistics.")
             for view in r.get("views", []):
                 total += view.get("count", 0)
 

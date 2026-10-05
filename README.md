@@ -88,6 +88,20 @@ After wasting a day playing with different color values finally settled on one. 
 ![](https://raw.githubusercontent.com/rahul-jha98/github-stats-transparent/main/readme_images/dark.png)
 
 
+## Statistics collection
+
+Statistics belong to the account that owns `ACCESS_TOKEN`. Line counts come
+from that account's individual commits on each repository's default branch,
+excluding merge commits and empty repositories. Commits are selected by the
+stable GitHub account ID, so renames and different workflow actors do not
+discard contributions. All pages of commit history are included.
+
+Unexpected API errors stop the workflow before publishing, preserving the
+existing images instead of replacing them with incomplete totals. Traffic
+counts still require permission to view each repository's traffic.
+
+Run the regression tests with `python3 -m unittest discover -s tests -v`.
+
 ## Related Projects
 
 - Extension of a detached fork of [jstrieb/github-stats](https://github.com/jstrieb/github-stats)
